@@ -11,12 +11,12 @@ from psycopg_pool import ConnectionPool
 from graph import build_graph
 from schemas import ResearchRequest, ReviewDecision, PendingReview, FinalAnswer
 from config import get_settings
- 
+
+settings = get_settings()
 _state = {}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    settings = get_settings()
     with ConnectionPool(
         conninfo=str(settings.database_url),
         min_size=settings.db_pool_min_size,
@@ -44,6 +44,7 @@ def _format_response(thread_id: str, result: dict):
             status = "pending_review",
             bullet_points = payload["bullet_points"],
             redo_count_so_far = payload["redo_count_so_far"],
+            redos_remaining = max(0, settings.max_redos - payload["redo_count_so_far"])
         )
 
     return FinalAnswer(
@@ -81,6 +82,13 @@ def submit_review(thread_id : str, decision: ReviewDecision):
 
     if not state.next:
         raise HTTPException(status_code=404, detail="No pending review for this thread_id")
+
+    current_redos = state.values.get("redo_count", 0)
+    if decision.type == "reject" and current_redos >= settings.max_redos:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum retries ({settings.max_redos}) reached. Please approve or edit the research notes.",
+        )
 
     result = graph.invoke(Command(resume=decision.model_dump()), config = config)
 

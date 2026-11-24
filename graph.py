@@ -34,7 +34,17 @@ def _create_web_search_tool(tavily_client: TavilySearch) -> BaseTool:
     @tool("web_search")
     def web_search(query: str) -> str:
         """Search the web for factual, up-to-date information on a given query."""
-        return tavily_client.invoke({"query": query})
+        raw = tavily_client.invoke({"query": query})
+        results = raw.get("results", []) if isinstance(raw, dict) else raw
+        if not isinstance(results, list):
+            return str(raw)[:1500]
+
+        compact = []
+        for item in results:
+            title = item.get("title", "")
+            content = (item.get("content") or "")[:400]
+            compact.append(f"- {title}: {content}")
+        return "\n".join(compact) if compact else "No relevant results found."
 
     return web_search
 
@@ -98,14 +108,26 @@ def build_graph(
         name="writer_agent",
     )
 
+    
     def research_node(state: GraphState) -> dict:
-        """Run web research and commit only the synthesized bullet points."""
-        result = research_agent.invoke({"messages": state["messages"]})
+        """Run web research using compact context and commit only synthesized bullet points."""
+        if state["redo_count"] == 0:
+            prompt = state["topic"]
+        else:
+            latest_feedback = state["messages"][-1].content
+            prompt = (
+                f"Topic: {state['topic']}\n\n"
+                f"Previous Draft:\n{state['research_notes']}\n\n"
+                f"{latest_feedback}"
+            )
+
+        result = research_agent.invoke({"messages": [HumanMessage(content=prompt)]})
         latest_ai_msg = result["messages"][-1]
         return {
             "messages": [latest_ai_msg],
             "research_notes": latest_ai_msg.content,
         }
+
 
     def human_review_node(state: GraphState) -> dict:
         """Suspend execution for human review and route based on decision."""

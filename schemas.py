@@ -51,6 +51,7 @@ class PendingReview(BaseModel):
     status: Literal["pending_review"] = "pending_review"
     bullet_points: str
     redo_count_so_far: int
+    redos_remaining: int
 
 
 class FinalAnswer(BaseModel):
