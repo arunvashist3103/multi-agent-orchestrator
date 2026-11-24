@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-dotenv
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg-pool
+langchain
+langchain-groq
+langchain-tavilypydantic-settings==2.16.3
+pydantic-settings==2.16.3
