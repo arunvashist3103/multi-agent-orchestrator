@@ -1,8 +1,10 @@
+"""Validated API payloads and pending-review/completed response contracts."""
+
 from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class ResearchRequest(BaseModel):
-    """Payload to initiate a new research workflow."""
+    """Research topic, stripped of surrounding whitespace before validation."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -15,7 +17,7 @@ class ResearchRequest(BaseModel):
     )
 
 class ReviewDecision(BaseModel):
-    """Human-in-the-loop review decision payload."""
+    """Approve notes, replace them with edited_content, or reject with feedback."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -34,6 +36,7 @@ class ReviewDecision(BaseModel):
     )
     @model_validator(mode="after")
     def validate_decision_requirements(self) -> "ReviewDecision":
+        """Require decision-specific text after field length/whitespace validation."""
         if self.type == "edit" and not self.edited_content:
             raise ValueError(
                 "edited_content is required (minimum 20 characters) when type is 'edit'."
@@ -45,7 +48,7 @@ class ReviewDecision(BaseModel):
         return self
 
 class PendingReview(BaseModel):
-    """Response returned when the workflow pauses for human review."""
+    """Notes awaiting review; redo counts exclude the initial research pass."""
 
     thread_id: str
     status: Literal["pending_review"] = "pending_review"
@@ -55,7 +58,7 @@ class PendingReview(BaseModel):
 
 
 class FinalAnswer(BaseModel):
-    """Response returned once the writer agent completes the final synthesis."""
+    """Completed writer output with the same thread ID used for human review."""
 
     thread_id: str
     status: Literal["complete"] = "complete"

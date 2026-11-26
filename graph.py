@@ -1,10 +1,13 @@
-"""Multi-Agent Research & Writing LangGraph Workflow."""
+"""Checkpointed research, human review, and writing with injectable providers."""
 
+import logging
+from time import perf_counter
 from typing import Annotated, Literal, TypedDict
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
@@ -17,9 +20,45 @@ from groq import APIConnectionError, APITimeoutError, BadRequestError
 from config import Settings, get_settings
 from prompts import RESEARCHER_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
 
+logger = logging.getLogger("research_service.graph")
+
+
+def _thread_id(config: RunnableConfig) -> str:
+    """Read the workflow correlation key, with a fallback for standalone calls."""
+    return str(config.get("configurable", {}).get("thread_id", "-"))
+
+
+def _invoke_agent(agent, prompt: str, node: str, config: RunnableConfig):
+    """Log one agent attempt without content; propagate results and failures.
+
+    retryable classifies the error; the node policy decides whether to retry.
+    """
+    started = perf_counter()
+    thread_id = _thread_id(config)
+    logger.info("Agent started thread_id=%s node=%s", thread_id, node)
+    try:
+        result = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config=config)
+    except Exception as exc:
+        retryable = isinstance(exc, (BadRequestError, APITimeoutError, APIConnectionError))
+        logger.log(
+            logging.WARNING if retryable else logging.ERROR,
+            "Agent attempt failed thread_id=%s node=%s error_type=%s retryable=%s duration_ms=%.2f",
+            thread_id, node, type(exc).__name__, retryable,
+            (perf_counter() - started) * 1000,
+        )
+        raise
+    logger.info(
+        "Agent completed thread_id=%s node=%s duration_ms=%.2f",
+        thread_id, node, (perf_counter() - started) * 1000,
+    )
+    return result
+
 
 class GraphState(TypedDict):
-    """Explicit state contract passed between workflow nodes."""
+    """Shared state: research_notes is the current draft or human replacement.
+
+    messages merges by ID; redo_count counts human-requested research repeats.
+    """
 
     topic: str
     messages: Annotated[list, add_messages]
@@ -29,16 +68,38 @@ class GraphState(TypedDict):
 
 
 def _create_web_search_tool(tavily_client: TavilySearch) -> BaseTool:
-    """Wrap TavilySearch in a minimal single-argument schema to prevent LLM argument hallucination."""
+    """Wrap Tavily with compact results and a query-only model-facing schema.
+
+    LangChain injects RunnableConfig; the model does not supply it.
+    """
 
     @tool("web_search")
-    def web_search(query: str) -> str:
+    def web_search(query: str, config: RunnableConfig) -> str:
         """Search the web for factual, up-to-date information on a given query."""
-        raw = tavily_client.invoke({"query": query})
+        # The tool docstring is sent to the model; changes affect its behavior.
+        started = perf_counter()
+        thread_id = _thread_id(config)
+        logger.debug("Web search started thread_id=%s", thread_id)
+        try:
+            raw = tavily_client.invoke({"query": query}, config=config)
+        except Exception as exc:
+            logger.error(
+                "Web search failed thread_id=%s error_type=%s duration_ms=%.2f",
+                thread_id, type(exc).__name__, (perf_counter() - started) * 1000,
+            )
+            raise
         results = raw.get("results", []) if isinstance(raw, dict) else raw
         if not isinstance(results, list):
+            logger.warning(
+                "Web search returned unexpected format thread_id=%s result_type=%s duration_ms=%.2f",
+                thread_id, type(results).__name__, (perf_counter() - started) * 1000,
+            )
             return str(raw)[:1500]
 
+        logger.info(
+            "Web search completed thread_id=%s result_count=%s duration_ms=%.2f",
+            thread_id, len(results), (perf_counter() - started) * 1000,
+        )
         compact = []
         for item in results:
             title = item.get("title", "")
@@ -59,14 +120,18 @@ def build_graph(
     llm: BaseChatModel | None = None,
     search_tool: BaseTool | None = None,
 ):
-    """Compile the research-and-writing state machine with injected dependencies."""
-    cfg = settings or get_settings()
+    """Compile the workflow with a caller-owned, initialized checkpointer.
 
-    # model = llm or ChatGroq(
-    #     model=cfg.llm_model_name,
-    #     temperature=cfg.llm_temperature,
-    #     api_key=cfg.groq_api_key.get_secret_value(),
-    # )
+    An injected llm serves both agents; otherwise use the configured providers.
+    Invoke with configurable.thread_id and resume with Command(resume=decision).
+    Direct callers must validate review payloads before resuming.
+    """
+    cfg = settings or get_settings()
+    logger.info(
+        "Building workflow researcher_model=%s writer_model=%s max_redos=%s injected_llm=%s injected_search=%s",
+        cfg.researcher_model_name, cfg.writer_model_name, cfg.max_redos,
+        llm is not None, search_tool is not None,
+    )
 
     researcher_llm = llm or ChatGroq(
         model=cfg.researcher_model_name,
@@ -109,8 +174,12 @@ def build_graph(
     )
 
     
-    def research_node(state: GraphState) -> dict:
-        """Run web research using compact context and commit only synthesized bullet points."""
+    def research_node(state: GraphState, config: RunnableConfig) -> dict:
+        """Research or revise notes; merge only the final message into outer state."""
+        logger.info(
+            "Research pass started thread_id=%s redo_count=%s",
+            _thread_id(config), state["redo_count"],
+        )
         if state["redo_count"] == 0:
             prompt = state["topic"]
         else:
@@ -121,7 +190,7 @@ def build_graph(
                 f"{latest_feedback}"
             )
 
-        result = research_agent.invoke({"messages": [HumanMessage(content=prompt)]})
+        result = _invoke_agent(research_agent, prompt, "researcher", config)
         latest_ai_msg = result["messages"][-1]
         return {
             "messages": [latest_ai_msg],
@@ -129,8 +198,12 @@ def build_graph(
         }
 
 
-    def human_review_node(state: GraphState) -> dict:
-        """Suspend execution for human review and route based on decision."""
+    def human_review_node(state: GraphState, config: RunnableConfig) -> dict:
+        """Pause for a review, then update notes and select the next node."""
+        thread_id = _thread_id(config)
+        # LangGraph replays this node on resume; avoid side effects before interrupt.
+        # Log the actual pause at the API boundary to avoid duplicate pause events.
+        logger.debug("Entering human review thread_id=%s", thread_id)
         decision = interrupt({
             "bullet_points": state["research_notes"],
             "redo_count_so_far": state["redo_count"],
@@ -139,9 +212,11 @@ def build_graph(
         decision_type = decision.get("type")
 
         if decision_type == "approve":
+            logger.info("Research approved thread_id=%s next_node=writer", thread_id)
             return {"review_action": "writer"}
 
         if decision_type == "edit":
+            logger.info("Research edited thread_id=%s next_node=writer", thread_id)
             return {
                 "review_action": "writer",
                 "research_notes": decision["edited_content"].strip(),
@@ -149,12 +224,21 @@ def build_graph(
 
         if decision_type == "reject":
             new_redo_count = state["redo_count"] + 1
+            # Direct-call fallback; the API refuses rejection beyond this limit.
             if new_redo_count > cfg.max_redos:
+                logger.warning(
+                    "Research retry limit exceeded thread_id=%s redo_count=%s next_node=writer",
+                    thread_id, new_redo_count,
+                )
                 return {
                     "review_action": "writer",
                     "redo_count": new_redo_count,
                 }
 
+            logger.info(
+                "Research rejected thread_id=%s redo_count=%s next_node=researcher",
+                thread_id, new_redo_count,
+            )
             return {
                 "review_action": "researcher",
                 "redo_count": new_redo_count,
@@ -165,19 +249,22 @@ def build_graph(
                 ],
             }
 
+        logger.error("Unsupported review decision thread_id=%s", thread_id)
         raise ValueError(f"Unsupported review decision type: {decision_type}")
     
 
-    def writer_node(state: GraphState) -> dict:
-        """Synthesize the original topic and single approved research_notes into prose."""
+    def writer_node(state: GraphState, config: RunnableConfig) -> dict:
+        """Write from current reviewed notes, excluding old drafts and tool history."""
         prompt = (
             f"Topic: {state['topic']}\n\n"
             f"Approved Research Bullet Points:\n{state['research_notes']}"
         )
-        result = writer_agent.invoke({"messages": [HumanMessage(content=prompt)]})
+        result = _invoke_agent(writer_agent, prompt, "writer", config)
         return {"messages": [result["messages"][-1]]}
 
 
+    # Three attempts include the initial call, with SDK retries inside each.
+    # These do not consume the reviewer's research redo budget.
     node_retry = RetryPolicy(
         max_attempts=3,
         initial_interval=1.0,
@@ -200,4 +287,6 @@ def build_graph(
     )
     graph.add_edge("writer", END)
 
-    return graph.compile(checkpointer=checkpointer)
+    compiled = graph.compile(checkpointer=checkpointer)
+    logger.info("Workflow compiled node_max_attempts=%s", node_retry.max_attempts)
+    return compiled

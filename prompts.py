@@ -1,4 +1,4 @@
-"""System prompts for the Research and Writing LangGraph agents."""
+"""Agent instructions; output format and factuality are not validated in code."""
 
 RESEARCHER_SYSTEM_PROMPT = """
 You are a Researcher agent. Your ONLY job is to gather 5-7 concise, factual bullet points on the topic you're given, using the available search tool.
