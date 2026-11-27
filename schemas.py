@@ -1,7 +1,7 @@
 """Validated API payloads and pending-review/completed response contracts."""
 
 from typing import Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
 class ResearchRequest(BaseModel):
     """Research topic, stripped of surrounding whitespace before validation."""
@@ -46,6 +46,13 @@ class ReviewDecision(BaseModel):
                 "feedback is required (minimum 10 characters) when type is 'reject'."
             )
         return self
+
+    @field_validator("edited_content", "feedback", mode="before")
+    @classmethod
+    def empty_str_to_none(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 class PendingReview(BaseModel):
     """Notes awaiting review; redo counts exclude the initial research pass."""

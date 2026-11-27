@@ -10,3 +10,5 @@ langchain-groq
 langchain-tavily
 pydantic-settings==2.16.3
 pydantic-settings==2.16.3
+pytest
+httpx

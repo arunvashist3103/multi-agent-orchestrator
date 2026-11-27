@@ -1,0 +1,13 @@
+[project]
+name = "langgraph-research-service"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "default",
+    "ignore:.*iscoroutinefunction.*:DeprecationWarning:langsmith.*",
+    "ignore:.*CallSpec2.*:pytest.PytestRemovedIn10Warning:anyio.*",
+    "ignore::DeprecationWarning:fastapi.*",
+]
